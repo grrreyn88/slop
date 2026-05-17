@@ -1,0 +1,547 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use serde::Serialize;
+use std::{
+    fs::{self, File},
+    io,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use tauri::{http, path::BaseDirectory, AppHandle, Emitter, Manager};
+use zip::ZipArchive;
+
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+const EVENT_NAME: &str = "setup://status";
+const UTILITY_EXE: &str = "injector.exe";
+const UTILITY_DLL: &str = "neverlose.dll";
+const LUA_ARCHIVE: &str = "lua_libs.zip";
+const UTILITY_RUNTIME_DIR: &str = "payload";
+const TELEGRAM_URL: &str = "https://t.me/nlcsgofix";
+const CSGO_APP_DIR: &str = "Counter-Strike Global Offensive";
+const CSGO_EXE: &str = "csgo.exe";
+const GAME_LIBRARY_PATH: &[&str] = &["nl_cloud", "scripts", "libraries"];
+const FRONTEND_INDEX: &[u8] = include_bytes!("../../frontend/index.html");
+const FRONTEND_STYLES: &[u8] = include_bytes!("../../frontend/styles.css");
+const FRONTEND_APP: &[u8] = include_bytes!("../../frontend/app.js");
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupEvent {
+    stage: String,
+    message: String,
+    percent: u8,
+    level: String,
+}
+
+#[derive(Clone, Default)]
+struct AppState {
+    inner: Arc<AppStateInner>,
+}
+
+#[derive(Default)]
+struct AppStateInner {
+    setup_started: AtomicBool,
+}
+
+fn emit_status(app: &AppHandle, stage: &str, message: impl Into<String>, percent: u8, level: &str) {
+    let payload = SetupEvent {
+        stage: stage.to_string(),
+        message: message.into(),
+        percent: percent.min(100),
+        level: level.to_string(),
+    };
+    let _ = app.emit(EVENT_NAME, payload);
+}
+
+fn frontend_response(request: http::Request<Vec<u8>>) -> http::Response<&'static [u8]> {
+    let (content_type, body) = match request.uri().path().trim_start_matches('/') {
+        "" | "index.html" => ("text/html; charset=utf-8", FRONTEND_INDEX),
+        "styles.css" => ("text/css; charset=utf-8", FRONTEND_STYLES),
+        "app.js" => ("application/javascript; charset=utf-8", FRONTEND_APP),
+        _ => ("text/html; charset=utf-8", FRONTEND_INDEX),
+    };
+
+    http::Response::builder()
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .expect("failed to build frontend response")
+}
+
+#[cfg(windows)]
+fn find_steam_path() -> Result<PathBuf, String> {
+    let key = windows_registry::CURRENT_USER
+        .open(r"Software\Valve\Steam")
+        .map_err(|error| format!("Steam registry key was not found: {error}"))?;
+    let steam_path = key
+        .get_string("SteamPath")
+        .map_err(|error| format!("SteamPath registry value was not found: {error}"))?;
+    let steam_path = steam_path.trim();
+
+    if steam_path.is_empty() {
+        return Err("SteamPath registry value is empty.".to_string());
+    }
+
+    Ok(PathBuf::from(steam_path))
+}
+
+#[cfg(not(windows))]
+fn find_steam_path() -> Result<PathBuf, String> {
+    Err("Steam registry lookup is only available on Windows.".to_string())
+}
+
+fn parse_vdf_path_value(line: &str) -> Option<PathBuf> {
+    let mut quoted_values = line
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|value| value.replace(r"\\", r"\"));
+
+    match (quoted_values.next(), quoted_values.next()) {
+        (Some(key), Some(value)) if key.eq_ignore_ascii_case("path") => Some(PathBuf::from(value)),
+        _ => None,
+    }
+}
+
+fn steam_library_roots(steam_path: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![steam_path.to_path_buf()];
+    let libraryfolders_path = steam_path.join("steamapps").join("libraryfolders.vdf");
+
+    if let Ok(contents) = fs::read_to_string(libraryfolders_path) {
+        for line in contents.lines() {
+            if let Some(path) = parse_vdf_path_value(line.trim()) {
+                roots.push(path);
+            }
+        }
+    }
+
+    let mut unique_roots = Vec::new();
+    for root in roots {
+        let key = root.to_string_lossy().to_lowercase();
+        if !unique_roots
+            .iter()
+            .any(|existing: &PathBuf| existing.to_string_lossy().to_lowercase() == key)
+        {
+            unique_roots.push(root);
+        }
+    }
+
+    unique_roots
+}
+
+fn find_csgo_dir() -> Result<PathBuf, String> {
+    let steam_path = find_steam_path()?;
+
+    for library_root in steam_library_roots(&steam_path) {
+        let candidate = library_root
+            .join("steamapps")
+            .join("common")
+            .join(CSGO_APP_DIR);
+        if candidate.join(CSGO_EXE).is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("Could not find Counter-Strike Global Offensive/csgo.exe in Steam libraries.".to_string())
+}
+
+fn game_libraries_dir(csgo_dir: &Path) -> PathBuf {
+    let mut libraries_dir = csgo_dir.to_path_buf();
+    for segment in GAME_LIBRARY_PATH {
+        libraries_dir.push(segment);
+    }
+    libraries_dir
+}
+
+fn bundled_payload_path(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
+    let bundled_path = app
+        .path()
+        .resolve(format!("payload/{file_name}"), BaseDirectory::Resource)
+        .map_err(|error| format!("Failed to resolve bundled resource {file_name}: {error}"))?;
+
+    if bundled_path.exists() {
+        return Ok(bundled_path);
+    }
+
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(file_name);
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+
+    Err(format!(
+        "Bundled resource {file_name} was not found at {}.",
+        bundled_path.display()
+    ))
+}
+
+#[cfg(windows)]
+fn extract_exe_icon_to_png(exe_path: &Path, output_path: &Path) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create icon cache directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fn powershell_string(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    let exe_path_arg = powershell_string(&exe_path.to_string_lossy());
+    let output_path_arg = powershell_string(&output_path.to_string_lossy());
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon({exe_path_arg})
+if ($null -eq $icon) {{ exit 2 }}
+$bitmap = $icon.ToBitmap()
+$bitmap.Save({output_path_arg}, [System.Drawing.Imaging.ImageFormat]::Png)
+$bitmap.Dispose()
+$icon.Dispose()
+"#
+    );
+
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
+    command.creation_flags(0x08000000);
+
+    let output = command.output().map_err(|error| {
+        format!(
+            "Failed to start PowerShell for icon extraction from {}: {error:?}",
+            exe_path.display()
+        )
+    })?;
+
+    if output.status.success() && output_path.is_file() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+
+    Err(format!(
+        "Failed to extract CS:GO icon from {}. {}",
+        exe_path.display(),
+        detail
+    ))
+}
+
+#[cfg(not(windows))]
+fn extract_exe_icon_to_png(_exe_path: &Path, _output_path: &Path) -> Result<(), String> {
+    Err("EXE icon extraction is only available on Windows.".to_string())
+}
+
+fn csgo_icon_data_url(app: &AppHandle) -> Result<String, String> {
+    let csgo_exe_path = find_csgo_dir()?.join(CSGO_EXE);
+    let icon_path = app
+        .path()
+        .resolve("csgo-icon.png", BaseDirectory::AppLocalData)
+        .map_err(|error| format!("Failed to resolve CS:GO icon cache path: {error}"))?;
+
+    extract_exe_icon_to_png(&csgo_exe_path, &icon_path)?;
+
+    let icon_bytes = fs::read(&icon_path)
+        .map_err(|error| format!("Failed to read CS:GO icon {}: {error}", icon_path.display()))?;
+
+    Ok(format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(icon_bytes)
+    ))
+}
+
+fn extract_lua_libraries(app: &AppHandle, libraries_dir: &Path) -> Result<(), String> {
+    let archive_path = bundled_payload_path(app, LUA_ARCHIVE)?;
+    fs::create_dir_all(libraries_dir).map_err(|error| {
+        format!(
+            "Failed to create libraries directory {}: {error}",
+            libraries_dir.display()
+        )
+    })?;
+
+    let archive_file = File::open(&archive_path)
+        .map_err(|error| format!("Failed to open {}: {error}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(archive_file).map_err(|error| {
+        format!(
+            "Failed to read ZIP archive {}: {error}",
+            archive_path.display()
+        )
+    })?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("Failed to read ZIP entry #{index}: {error}"))?;
+        let entry_name = entry.name().to_string();
+        let enclosed_name = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("ZIP entry has unsafe path: {entry_name}"))?;
+        if enclosed_name.as_os_str().is_empty() {
+            continue;
+        }
+
+        let output_path = libraries_dir.join(enclosed_name);
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path).map_err(|error| {
+                format!(
+                    "Failed to create directory {}: {error}",
+                    output_path.display()
+                )
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Failed to create directory {}: {error}", parent.display())
+            })?;
+        }
+
+        let mut output_file = File::create(&output_path)
+            .map_err(|error| format!("Failed to create {}: {error}", output_path.display()))?;
+        io::copy(&mut entry, &mut output_file)
+            .map_err(|error| format!("Failed to extract {}: {error}", output_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn clean_windows_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path_text = path.to_string_lossy();
+        if let Some(stripped) = path_text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = path_text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+fn canonical_runtime_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .map(|path| clean_windows_path(&path))
+        .unwrap_or_else(|_| clean_windows_path(path))
+}
+
+#[cfg(windows)]
+fn terminate_existing_utility_process() {
+    let mut cmd = Command::new("taskkill.exe");
+    cmd.args(["/IM", UTILITY_EXE, "/F", "/T"]);
+    cmd.creation_flags(0x08000000);
+
+    let _ = cmd.output();
+}
+
+#[cfg(not(windows))]
+fn terminate_existing_utility_process() {}
+
+fn copy_payload_to_runtime(
+    app: &AppHandle,
+    file_name: &str,
+    runtime_dir: &Path,
+) -> Result<PathBuf, String> {
+    let source_path = bundled_payload_path(app, file_name)?;
+    let destination_path = runtime_dir.join(file_name);
+
+    let copy_result = fs::copy(&source_path, &destination_path).or_else(|first_error| {
+        if file_name.eq_ignore_ascii_case(UTILITY_EXE) {
+            terminate_existing_utility_process();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            fs::copy(&source_path, &destination_path)
+        } else {
+            Err(first_error)
+        }
+    });
+
+    copy_result.map_err(|error| {
+        format!(
+            "Failed to copy {} to {}: {error:?}",
+            source_path.display(),
+            destination_path.display()
+        )
+    })?;
+
+    if !destination_path.is_file() {
+        return Err(format!(
+            "Runtime file {} was not created.",
+            destination_path.display()
+        ));
+    }
+
+    Ok(destination_path)
+}
+
+fn prepare_utility_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    terminate_existing_utility_process();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let runtime_dir = app
+        .path()
+        .resolve(UTILITY_RUNTIME_DIR, BaseDirectory::AppLocalData)
+        .map_err(|error| format!("Failed to resolve runtime payload directory: {error}"))?;
+
+    fs::create_dir_all(&runtime_dir).map_err(|error| {
+        format!(
+            "Failed to create runtime payload directory {}: {error}",
+            runtime_dir.display()
+        )
+    })?;
+
+    let exe_path = copy_payload_to_runtime(app, UTILITY_EXE, &runtime_dir)?;
+    let dll_path = copy_payload_to_runtime(app, UTILITY_DLL, &runtime_dir)?;
+
+    let runtime_dir = canonical_runtime_path(&runtime_dir);
+    let exe_path = canonical_runtime_path(&exe_path);
+    let dll_path = canonical_runtime_path(&dll_path);
+
+    if exe_path.parent() != Some(runtime_dir.as_path())
+        || dll_path.parent() != Some(runtime_dir.as_path())
+    {
+        return Err(format!(
+            "Utility files must be in the same runtime directory. exe: {}, dll: {}, dir: {}",
+            exe_path.display(),
+            dll_path.display(),
+            runtime_dir.display()
+        ));
+    }
+
+    Ok((runtime_dir, exe_path, dll_path))
+}
+
+fn launch_bundled_utility(app: &AppHandle) -> Result<(), String> {
+    let (runtime_dir, exe_path, _dll_path) = prepare_utility_runtime(app)?;
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut cmd = Command::new(&exe_path);
+    cmd.current_dir(&runtime_dir);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("System launch error (code/text): {:?}", error)),
+    }
+}
+
+async fn run_loader_sequence(app: AppHandle) -> Result<(), String> {
+    emit_status(&app, "steam", "Finding CS:GO installation...", 25, "info");
+    let csgo_dir = find_csgo_dir()?;
+    let libraries_dir = game_libraries_dir(&csgo_dir);
+
+    emit_status(&app, "archive", "Installing Lua libraries...", 50, "info");
+    extract_lua_libraries(&app, &libraries_dir)?;
+
+    emit_status(&app, "utility", "Starting bundled utility...", 75, "info");
+    launch_bundled_utility(&app)?;
+
+    emit_status(&app, "done", "Done! You can open CS:GO", 100, "success");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_setup(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.inner.setup_started.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let state_inner = state.inner.clone();
+    tauri::async_runtime::spawn(async move {
+        match run_loader_sequence(app.clone()).await {
+            Ok(()) => {
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+            Err(error) => {
+                emit_status(&app, "error", error, 75, "error");
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn exit_app(app: AppHandle) {
+    terminate_existing_utility_process();
+    app.exit(0);
+}
+
+#[tauri::command]
+fn close_loader(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+fn minimize_app(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.minimize();
+    }
+}
+
+#[tauri::command]
+fn drag_app(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.start_dragging();
+    }
+}
+
+#[tauri::command]
+fn open_telegram_link(url: String) -> Result<(), String> {
+    if url != TELEGRAM_URL {
+        return Err("Unsupported external URL.".to_string());
+    }
+
+    Command::new("explorer.exe")
+        .arg(TELEGRAM_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Failed to open Telegram link: {:?}", error))
+}
+
+#[tauri::command]
+fn get_csgo_icon(app: AppHandle) -> Result<String, String> {
+    csgo_icon_data_url(&app)
+}
+
+fn main() {
+    tauri::Builder::default()
+        .register_uri_scheme_protocol("nl", |_ctx, request| frontend_response(request))
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            start_setup,
+            exit_app,
+            close_loader,
+            minimize_app,
+            drag_app,
+            open_telegram_link,
+            get_csgo_icon
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
