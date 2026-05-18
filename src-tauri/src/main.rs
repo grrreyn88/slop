@@ -3,7 +3,7 @@
 use serde::Serialize;
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Cursor},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -30,6 +30,12 @@ const GAME_LIBRARY_PATH: &[&str] = &["nl_cloud", "scripts", "libraries"];
 const FRONTEND_INDEX: &[u8] = include_bytes!("../../frontend/index.html");
 const FRONTEND_STYLES: &[u8] = include_bytes!("../../frontend/styles.css");
 const FRONTEND_APP: &[u8] = include_bytes!("../../frontend/app.js");
+const UTILITY_EXE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/injector.exe"));
+const UTILITY_DLL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/neverlose.dll"));
+const LUA_ARCHIVE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/lua_libs.zip"));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,27 +165,18 @@ fn game_libraries_dir(csgo_dir: &Path) -> PathBuf {
     libraries_dir
 }
 
-fn bundled_payload_path(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
-    let bundled_path = app
-        .path()
-        .resolve(format!("payload/{file_name}"), BaseDirectory::Resource)
-        .map_err(|error| format!("Failed to resolve bundled resource {file_name}: {error}"))?;
-
-    if bundled_path.exists() {
-        return Ok(bundled_path);
+fn bundled_payload_bytes(file_name: &str) -> Result<&'static [u8], String> {
+    if file_name.eq_ignore_ascii_case(UTILITY_EXE) {
+        return Ok(UTILITY_EXE_BYTES);
+    }
+    if file_name.eq_ignore_ascii_case(UTILITY_DLL) {
+        return Ok(UTILITY_DLL_BYTES);
+    }
+    if file_name.eq_ignore_ascii_case(LUA_ARCHIVE) {
+        return Ok(LUA_ARCHIVE_BYTES);
     }
 
-    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join(file_name);
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-
-    Err(format!(
-        "Bundled resource {file_name} was not found at {}.",
-        bundled_path.display()
-    ))
+    Err(format!("Unknown bundled payload file: {file_name}"))
 }
 
 #[cfg(windows)]
@@ -267,8 +264,8 @@ fn csgo_icon_data_url(app: &AppHandle) -> Result<String, String> {
     ))
 }
 
-fn extract_lua_libraries(app: &AppHandle, libraries_dir: &Path) -> Result<(), String> {
-    let archive_path = bundled_payload_path(app, LUA_ARCHIVE)?;
+fn extract_lua_libraries(libraries_dir: &Path) -> Result<(), String> {
+    let archive_bytes = bundled_payload_bytes(LUA_ARCHIVE)?;
     fs::create_dir_all(libraries_dir).map_err(|error| {
         format!(
             "Failed to create libraries directory {}: {error}",
@@ -276,14 +273,8 @@ fn extract_lua_libraries(app: &AppHandle, libraries_dir: &Path) -> Result<(), St
         )
     })?;
 
-    let archive_file = File::open(&archive_path)
-        .map_err(|error| format!("Failed to open {}: {error}", archive_path.display()))?;
-    let mut archive = ZipArchive::new(archive_file).map_err(|error| {
-        format!(
-            "Failed to read ZIP archive {}: {error}",
-            archive_path.display()
-        )
-    })?;
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
+        .map_err(|error| format!("Failed to read embedded ZIP archive {LUA_ARCHIVE}: {error}"))?;
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -357,27 +348,25 @@ fn terminate_existing_utility_process() {
 fn terminate_existing_utility_process() {}
 
 fn copy_payload_to_runtime(
-    app: &AppHandle,
     file_name: &str,
     runtime_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let source_path = bundled_payload_path(app, file_name)?;
+    let payload_bytes = bundled_payload_bytes(file_name)?;
     let destination_path = runtime_dir.join(file_name);
 
-    let copy_result = fs::copy(&source_path, &destination_path).or_else(|first_error| {
+    let write_result = fs::write(&destination_path, payload_bytes).or_else(|first_error| {
         if file_name.eq_ignore_ascii_case(UTILITY_EXE) {
             terminate_existing_utility_process();
             std::thread::sleep(std::time::Duration::from_millis(500));
-            fs::copy(&source_path, &destination_path)
+            fs::write(&destination_path, payload_bytes)
         } else {
             Err(first_error)
         }
     });
 
-    copy_result.map_err(|error| {
+    write_result.map_err(|error| {
         format!(
-            "Failed to copy {} to {}: {error:?}",
-            source_path.display(),
+            "Failed to write embedded {file_name} to {}: {error:?}",
             destination_path.display()
         )
     })?;
@@ -408,8 +397,8 @@ fn prepare_utility_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathBuf
         )
     })?;
 
-    let exe_path = copy_payload_to_runtime(app, UTILITY_EXE, &runtime_dir)?;
-    let dll_path = copy_payload_to_runtime(app, UTILITY_DLL, &runtime_dir)?;
+    let exe_path = copy_payload_to_runtime(UTILITY_EXE, &runtime_dir)?;
+    let dll_path = copy_payload_to_runtime(UTILITY_DLL, &runtime_dir)?;
 
     let runtime_dir = canonical_runtime_path(&runtime_dir);
     let exe_path = canonical_runtime_path(&exe_path);
@@ -451,7 +440,7 @@ async fn run_loader_sequence(app: AppHandle) -> Result<(), String> {
     let libraries_dir = game_libraries_dir(&csgo_dir);
 
     emit_status(&app, "archive", "Installing Lua libraries...", 50, "info");
-    extract_lua_libraries(&app, &libraries_dir)?;
+    extract_lua_libraries(&libraries_dir)?;
 
     emit_status(&app, "utility", "Starting bundled utility...", 75, "info");
     launch_bundled_utility(&app)?;

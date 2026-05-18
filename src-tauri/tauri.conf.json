@@ -32,11 +32,11 @@
     "icon": [
       "app_icon.png"
     ],
-    "resources": {
-      "resources/injector.exe": "payload/injector.exe",
-      "resources/neverlose.dll": "payload/neverlose.dll",
-      "resources/lua_libs.zip": "payload/lua_libs.zip"
-    },
+    "resources": [
+      "resources/injector.exe",
+      "resources/neverlose.dll",
+      "resources/lua_libs.zip"
+    ],
     "windows": {
       "digestAlgorithm": "sha256"
     }
