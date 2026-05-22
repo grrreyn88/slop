@@ -78,7 +78,7 @@
     if (!window.__TAURI__?.core?.invoke || !gameIconImage) return;
 
     try {
-      const iconDataUrl = await window.__TAURI__.core.invoke("get_csgo_icon");
+      const iconDataUrl = await window.__TAURI__.core.invoke("get_csgo_icon").catch(() => null);
       if (typeof iconDataUrl === "string" && iconDataUrl.startsWith("data:image/")) {
         gameIconImage.src = iconDataUrl;
         gameIconImage.hidden = false;
@@ -165,7 +165,7 @@
   }
 
   launchButton?.addEventListener("click", startSequence);
-  await loadGameIcon();
+  loadGameIcon();
   window.setTimeout(loadGameIcon, 1200);
 
   if (window.__TAURI__?.event?.listen) {

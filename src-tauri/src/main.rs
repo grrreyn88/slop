@@ -514,8 +514,8 @@ fn open_telegram_link(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_csgo_icon(app: AppHandle) -> Result<String, String> {
-    csgo_icon_data_url(&app)
+fn get_csgo_icon(app: AppHandle) -> Option<String> {
+    csgo_icon_data_url(&app).ok()
 }
 
 fn main() {
