@@ -21,8 +21,14 @@ use std::os::windows::process::CommandExt;
 const EVENT_NAME: &str = "setup://status";
 const UTILITY_EXE: &str = "injector.exe";
 const UTILITY_DLL: &str = "neverlose.dll";
+const PRIMO_EXE: &str = "primo.exe";
+const PRIMO_DLL: &str = "primordial-csgo.dll";
+const GAMESENSE_EXE: &str = "skeet2.exe";
+const GAMESENSE_DLL: &str = "skeet.dll";
 const LUA_ARCHIVE: &str = "lua_libs.zip";
 const UTILITY_RUNTIME_DIR: &str = "payload";
+const PRIMO_RUNTIME_DIR: &str = "primordial-payload";
+const GAMESENSE_RUNTIME_DIR: &str = "gamesense-payload";
 const TELEGRAM_URL: &str = "https://t.me/nlcsgofix";
 const CSGO_APP_DIR: &str = "Counter-Strike Global Offensive";
 const CSGO_EXE: &str = "csgo.exe";
@@ -30,12 +36,37 @@ const GAME_LIBRARY_PATH: &[&str] = &["nl_cloud", "scripts", "libraries"];
 const FRONTEND_INDEX: &[u8] = include_bytes!("../../frontend/index.html");
 const FRONTEND_STYLES: &[u8] = include_bytes!("../../frontend/styles.css");
 const FRONTEND_APP: &[u8] = include_bytes!("../../frontend/app.js");
-const UTILITY_EXE_BYTES: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/injector.exe"));
-const UTILITY_DLL_BYTES: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/neverlose.dll"));
-const LUA_ARCHIVE_BYTES: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/lua_libs.zip"));
+const FRONTEND_GS_ICON: &[u8] = include_bytes!("../../frontend/assets/images/gs.png");
+const FRONTEND_PRIMO_ICON: &[u8] = include_bytes!("../../frontend/assets/images/primo.png");
+const FRONTEND_NL_ICON: &[u8] = include_bytes!("../../frontend/assets/images/nl.png");
+const UTILITY_EXE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/injector.exe"
+));
+const UTILITY_DLL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/neverlose.dll"
+));
+const PRIMO_EXE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/primordial/primo.exe"
+));
+const PRIMO_DLL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/primordial/primordial-csgo.dll"
+));
+const GAMESENSE_EXE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/gamesense/skeet2.exe"
+));
+const GAMESENSE_DLL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/gamesense/skeet.dll"
+));
+const LUA_ARCHIVE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/lua_libs.zip"
+));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +102,9 @@ fn frontend_response(request: http::Request<Vec<u8>>) -> http::Response<&'static
         "" | "index.html" => ("text/html; charset=utf-8", FRONTEND_INDEX),
         "styles.css" => ("text/css; charset=utf-8", FRONTEND_STYLES),
         "app.js" => ("application/javascript; charset=utf-8", FRONTEND_APP),
+        "assets/images/gs.png" => ("image/png", FRONTEND_GS_ICON),
+        "assets/images/primo.png" => ("image/png", FRONTEND_PRIMO_ICON),
+        "assets/images/nl.png" => ("image/png", FRONTEND_NL_ICON),
         _ => ("text/html; charset=utf-8", FRONTEND_INDEX),
     };
 
@@ -172,11 +206,28 @@ fn bundled_payload_bytes(file_name: &str) -> Result<&'static [u8], String> {
     if file_name.eq_ignore_ascii_case(UTILITY_DLL) {
         return Ok(UTILITY_DLL_BYTES);
     }
+    if file_name.eq_ignore_ascii_case(PRIMO_EXE) {
+        return Ok(PRIMO_EXE_BYTES);
+    }
+    if file_name.eq_ignore_ascii_case(PRIMO_DLL) {
+        return Ok(PRIMO_DLL_BYTES);
+    }
+    if file_name.eq_ignore_ascii_case(GAMESENSE_EXE) {
+        return Ok(GAMESENSE_EXE_BYTES);
+    }
+    if file_name.eq_ignore_ascii_case(GAMESENSE_DLL) {
+        return Ok(GAMESENSE_DLL_BYTES);
+    }
     if file_name.eq_ignore_ascii_case(LUA_ARCHIVE) {
         return Ok(LUA_ARCHIVE_BYTES);
     }
 
     Err(format!("Unknown bundled payload file: {file_name}"))
+}
+
+#[cfg(windows)]
+fn powershell_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(windows)]
@@ -188,10 +239,6 @@ fn extract_exe_icon_to_png(exe_path: &Path, output_path: &Path) -> Result<(), St
                 parent.display()
             )
         })?;
-    }
-
-    fn powershell_string(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
     }
 
     let exe_path_arg = powershell_string(&exe_path.to_string_lossy());
@@ -336,27 +383,48 @@ fn canonical_runtime_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn terminate_existing_utility_process() {
+fn terminate_process_by_image(file_name: &str) {
     let mut cmd = Command::new("taskkill.exe");
-    cmd.args(["/IM", UTILITY_EXE, "/F", "/T"]);
+    cmd.args(["/IM", file_name, "/F", "/T"]);
     cmd.creation_flags(0x08000000);
 
     let _ = cmd.output();
 }
 
 #[cfg(not(windows))]
-fn terminate_existing_utility_process() {}
+fn terminate_process_by_image(_file_name: &str) {}
 
-fn copy_payload_to_runtime(
-    file_name: &str,
-    runtime_dir: &Path,
-) -> Result<PathBuf, String> {
+fn terminate_existing_utility_process() {
+    terminate_process_by_image(UTILITY_EXE);
+}
+
+fn terminate_existing_primo_process() {
+    terminate_process_by_image(PRIMO_EXE);
+}
+
+fn terminate_existing_gamesense_process() {
+    terminate_process_by_image(GAMESENSE_EXE);
+}
+
+fn copy_payload_to_runtime(file_name: &str, runtime_dir: &Path) -> Result<PathBuf, String> {
     let payload_bytes = bundled_payload_bytes(file_name)?;
     let destination_path = runtime_dir.join(file_name);
 
     let write_result = fs::write(&destination_path, payload_bytes).or_else(|first_error| {
-        if file_name.eq_ignore_ascii_case(UTILITY_EXE) {
-            terminate_existing_utility_process();
+        if file_name.eq_ignore_ascii_case(UTILITY_EXE)
+            || file_name.eq_ignore_ascii_case(PRIMO_EXE)
+            || file_name.eq_ignore_ascii_case(GAMESENSE_EXE)
+            || file_name.eq_ignore_ascii_case(GAMESENSE_DLL)
+        {
+            if file_name.eq_ignore_ascii_case(PRIMO_EXE) {
+                terminate_existing_primo_process();
+            } else if file_name.eq_ignore_ascii_case(GAMESENSE_EXE)
+                || file_name.eq_ignore_ascii_case(GAMESENSE_DLL)
+            {
+                terminate_existing_gamesense_process();
+            } else {
+                terminate_existing_utility_process();
+            }
             std::thread::sleep(std::time::Duration::from_millis(500));
             fs::write(&destination_path, payload_bytes)
         } else {
@@ -418,6 +486,80 @@ fn prepare_utility_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathBuf
     Ok((runtime_dir, exe_path, dll_path))
 }
 
+fn prepare_primo_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    terminate_existing_primo_process();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let runtime_dir = app
+        .path()
+        .resolve(PRIMO_RUNTIME_DIR, BaseDirectory::AppLocalData)
+        .map_err(|error| format!("Failed to resolve Primordial payload directory: {error}"))?;
+
+    fs::create_dir_all(&runtime_dir).map_err(|error| {
+        format!(
+            "Failed to create Primordial payload directory {}: {error}",
+            runtime_dir.display()
+        )
+    })?;
+
+    let exe_path = copy_payload_to_runtime(PRIMO_EXE, &runtime_dir)?;
+    let dll_path = copy_payload_to_runtime(PRIMO_DLL, &runtime_dir)?;
+
+    let runtime_dir = canonical_runtime_path(&runtime_dir);
+    let exe_path = canonical_runtime_path(&exe_path);
+    let dll_path = canonical_runtime_path(&dll_path);
+
+    if exe_path.parent() != Some(runtime_dir.as_path())
+        || dll_path.parent() != Some(runtime_dir.as_path())
+    {
+        return Err(format!(
+            "Primordial files must be in the same runtime directory. exe: {}, dll: {}, dir: {}",
+            exe_path.display(),
+            dll_path.display(),
+            runtime_dir.display()
+        ));
+    }
+
+    Ok((runtime_dir, exe_path, dll_path))
+}
+
+fn prepare_gamesense_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    terminate_existing_gamesense_process();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let runtime_dir = app
+        .path()
+        .resolve(GAMESENSE_RUNTIME_DIR, BaseDirectory::AppLocalData)
+        .map_err(|error| format!("Failed to resolve Gamesense payload directory: {error}"))?;
+
+    fs::create_dir_all(&runtime_dir).map_err(|error| {
+        format!(
+            "Failed to create Gamesense payload directory {}: {error}",
+            runtime_dir.display()
+        )
+    })?;
+
+    let exe_path = copy_payload_to_runtime(GAMESENSE_EXE, &runtime_dir)?;
+    let dll_path = copy_payload_to_runtime(GAMESENSE_DLL, &runtime_dir)?;
+
+    let runtime_dir = canonical_runtime_path(&runtime_dir);
+    let exe_path = canonical_runtime_path(&exe_path);
+    let dll_path = canonical_runtime_path(&dll_path);
+
+    if exe_path.parent() != Some(runtime_dir.as_path())
+        || dll_path.parent() != Some(runtime_dir.as_path())
+    {
+        return Err(format!(
+            "Gamesense files must be in the same runtime directory. exe: {}, dll: {}, dir: {}",
+            exe_path.display(),
+            dll_path.display(),
+            runtime_dir.display()
+        ));
+    }
+
+    Ok((runtime_dir, exe_path, dll_path))
+}
+
 fn launch_bundled_utility(app: &AppHandle) -> Result<(), String> {
     let (runtime_dir, exe_path, _dll_path) = prepare_utility_runtime(app)?;
 
@@ -431,6 +573,75 @@ fn launch_bundled_utility(app: &AppHandle) -> Result<(), String> {
     match cmd.spawn() {
         Ok(_) => Ok(()),
         Err(error) => Err(format!("System launch error (code/text): {:?}", error)),
+    }
+}
+
+fn launch_primordial(app: &AppHandle) -> Result<(), String> {
+    let (runtime_dir, exe_path, _dll_path) = prepare_primo_runtime(app)?;
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    #[cfg(windows)]
+    {
+        let exe_path_arg = powershell_string(&exe_path.to_string_lossy());
+        let runtime_dir_arg = powershell_string(&runtime_dir.to_string_lossy());
+        let script = format!(
+            "Start-Process -FilePath {exe_path_arg} -WorkingDirectory {runtime_dir_arg} -Verb RunAs -WindowStyle Hidden"
+        );
+
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ]);
+        cmd.creation_flags(0x08000000);
+
+        let output = cmd
+            .output()
+            .map_err(|error| format!("System elevated launch error (code/text): {:?}", error))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("Elevated Primordial launch failed: {detail}"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new(&exe_path);
+        cmd.current_dir(&runtime_dir);
+
+        match cmd.spawn() {
+            Ok(_) => Ok(()),
+            Err(error) => Err(format!("System launch error (code/text): {:?}", error)),
+        }
+    }
+}
+
+fn launch_gamesense(app: &AppHandle) -> Result<(), String> {
+    let (runtime_dir, exe_path, _dll_path) = prepare_gamesense_runtime(app)?;
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut cmd = Command::new(&exe_path);
+    cmd.current_dir(&runtime_dir);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!(
+            "System Gamesense launch error (code/text): {:?}",
+            error
+        )),
     }
 }
 
@@ -449,6 +660,55 @@ async fn run_loader_sequence(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
     }
+
+    Ok(())
+}
+
+async fn run_gamesense_sequence(app: AppHandle) -> Result<(), String> {
+    emit_status(&app, "gamesense", "Starting Gamesense...", 75, "info");
+    launch_gamesense(&app)?;
+
+    emit_status(&app, "done", "Done! Open CS:GO", 100, "success");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+
+    Ok(())
+}
+
+async fn run_primo_sequence(app: AppHandle) -> Result<(), String> {
+    emit_status(&app, "primordial", "Starting Primordial...", 75, "info");
+    launch_primordial(&app)?;
+
+    emit_status(&app, "done", "Done! Open CS:GO", 100, "success");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_gamesense_setup(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.inner.setup_started.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let state_inner = state.inner.clone();
+    tauri::async_runtime::spawn(async move {
+        match run_gamesense_sequence(app.clone()).await {
+            Ok(()) => {
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+            Err(error) => {
+                emit_status(&app, "error", error, 75, "error");
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+        }
+    });
 
     Ok(())
 }
@@ -476,8 +736,35 @@ async fn start_setup(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
+async fn start_primo_setup(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.inner.setup_started.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let state_inner = state.inner.clone();
+    tauri::async_runtime::spawn(async move {
+        match run_primo_sequence(app.clone()).await {
+            Ok(()) => {
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+            Err(error) => {
+                emit_status(&app, "error", error, 75, "error");
+                state_inner.setup_started.store(false, Ordering::SeqCst);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
 fn exit_app(app: AppHandle) {
     terminate_existing_utility_process();
+    terminate_existing_primo_process();
+    terminate_existing_gamesense_process();
     app.exit(0);
 }
 
@@ -524,6 +811,8 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             start_setup,
+            start_primo_setup,
+            start_gamesense_setup,
             exit_app,
             close_loader,
             minimize_app,

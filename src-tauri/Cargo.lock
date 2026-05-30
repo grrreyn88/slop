@@ -1770,6 +1770,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "loader"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "embed-resource 2.5.2",
+ "serde",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "windows-registry",
+ "zip",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1923,20 +1937,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "neverlose"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "embed-resource 2.5.2",
- "serde",
- "tauri",
- "tauri-build",
- "tokio",
- "windows-registry",
- "zip",
 ]
 
 [[package]]

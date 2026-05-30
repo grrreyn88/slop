@@ -1,5 +1,5 @@
 [package]
-name = "neverlose"
+name = "loader"
 version = "0.1.0"
 description = "Trusted local service launcher"
 authors = ["you"]

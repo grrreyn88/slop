@@ -4,13 +4,12 @@
   const minimizeButton = document.getElementById("minimizeButton");
   const launchButton = document.getElementById("launchButton");
   const loaderFill = document.getElementById("loaderFill");
-  const doneMessage = document.getElementById("doneMessage");
   const telegramLink = document.getElementById("telegramLink");
-  const gameIconImage = document.getElementById("gameIconImage");
-  const gameIconFallback = document.getElementById("gameIconFallback");
+  const productButtons = Array.from(document.querySelectorAll("[data-product]"));
   const dragStrip = document.querySelector(".drag-strip");
   const launchFadeMs = 420;
   const fillAnimationMs = 900;
+  let selectedProduct = "nl";
   let setupStarted = false;
   let closeTimer = null;
 
@@ -23,6 +22,19 @@
       label.textContent = text;
     } else {
       launchButton.textContent = text;
+    }
+  }
+
+  function selectProduct(product) {
+    if (setupStarted) return;
+
+    selectedProduct = product;
+    document.body.dataset.product = product;
+    document.body.dataset.statusLevel = "info";
+    if (statusText) statusText.textContent = "";
+
+    for (const button of productButtons) {
+      button.classList.toggle("menu-item-active", button.dataset.product === product);
     }
   }
 
@@ -73,20 +85,6 @@
       window.location.href = url;
     }
   });
-
-  async function loadGameIcon() {
-    if (!window.__TAURI__?.core?.invoke || !gameIconImage) return;
-
-    try {
-      const iconDataUrl = await window.__TAURI__.core.invoke("get_csgo_icon").catch(() => null);
-      if (typeof iconDataUrl === "string" && iconDataUrl.startsWith("data:image/")) {
-        gameIconImage.src = iconDataUrl;
-        gameIconImage.hidden = false;
-        if (gameIconFallback) gameIconFallback.hidden = true;
-      }
-    } catch {
-    }
-  }
 
   function setProgress(value) {
     const safeValue = Math.max(0, Math.min(100, value));
@@ -154,7 +152,13 @@
     }
 
     try {
-      await window.__TAURI__.core.invoke("start_setup");
+      const command =
+        selectedProduct === "gs"
+          ? "start_gamesense_setup"
+          : selectedProduct === "primo"
+            ? "start_primo_setup"
+            : "start_setup";
+      await window.__TAURI__.core.invoke(command);
     } catch (error) {
       setupStarted = false;
       document.body.dataset.statusLevel = "error";
@@ -165,8 +169,10 @@
   }
 
   launchButton?.addEventListener("click", startSequence);
-  loadGameIcon();
-  window.setTimeout(loadGameIcon, 1200);
+  productButtons.forEach((button) => {
+    button.addEventListener("click", () => selectProduct(button.dataset.product || "nl"));
+  });
+  selectProduct("nl");
 
   if (window.__TAURI__?.event?.listen) {
     await window.__TAURI__.event.listen("setup://status", (event) => {

@@ -1,10 +1,15 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
 
 :root {
+  --sidebar-width: 190px;
   --bg-1: rgba(5, 13, 24, 0.94);
   --bg-2: rgba(8, 21, 38, 0.9);
   --fg-main: #eef5ff;
   --fg-soft: #9ab2cc;
+  --accent-rgb: 43, 214, 255;
+  --button-top: rgba(12, 112, 139, 0.9);
+  --button-bottom: rgba(10, 101, 126, 0.88);
+  --button-solid: #0a6d86;
 }
 
 *,
@@ -26,6 +31,27 @@ body {
 
 body {
   user-select: none;
+}
+
+body[data-product="gs"] {
+  --accent-rgb: 72, 168, 0;
+  --button-top: rgba(78, 184, 0, 0.96);
+  --button-bottom: rgba(54, 139, 0, 0.94);
+  --button-solid: #48a800;
+}
+
+body[data-product="primo"] {
+  --accent-rgb: 235, 151, 185;
+  --button-top: rgba(236, 154, 190, 0.96);
+  --button-bottom: rgba(207, 103, 159, 0.94);
+  --button-solid: #d071a3;
+}
+
+body[data-product="nl"] {
+  --accent-rgb: 43, 214, 255;
+  --button-top: rgba(12, 112, 139, 0.9);
+  --button-bottom: rgba(10, 101, 126, 0.88);
+  --button-solid: #0a6d86;
 }
 
 .shell {
@@ -185,7 +211,7 @@ body[data-done="true"] .done-message {
 .sidebar {
   position: relative;
   z-index: 2;
-  width: 170px;
+  width: var(--sidebar-width);
   padding: 32px 16px 16px;
   display: flex;
   flex-direction: column;
@@ -209,38 +235,54 @@ body[data-done="true"] .done-message {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-top: 6px;
+  margin-top: 14px;
 }
 
 .menu-item {
   display: block;
-  padding: 11px 12px;
+  width: 100%;
+  padding: 12px 11px;
+  border: 1px solid transparent;
   border-radius: 6px;
-  font-size: 0.95rem;
+  background: transparent;
+  font-size: 0.9rem;
+  font: 700 0.9rem/1 "Inter", "Segoe UI", Arial, sans-serif;
   color: #acc2dc;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
 }
 
 .menu-item-with-icon {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
 }
 
 .menu-item-active {
   color: #f3f8ff;
-  background: rgba(43, 214, 255, 0.12);
-  border: 1px solid rgba(43, 214, 255, 0.28);
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--accent-rgb), 0.3);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
+.menu-item:hover {
+  color: #f3f8ff;
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
 .game-icon {
-  width: 18px;
-  height: 18px;
+  width: 34px;
+  height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: #ffffff;
-  flex: 0 0 18px;
+  flex: 0 0 34px;
 }
 
 .game-icon svg {
@@ -250,16 +292,32 @@ body[data-done="true"] .done-message {
 }
 
 .game-icon-image {
-  width: 20px;
-  height: 20px;
+  width: 28px;
+  height: 28px;
   display: block;
   object-fit: contain;
-  filter: drop-shadow(0 0 6px rgba(120, 226, 255, 0.18));
+  border-radius: 4px;
+  filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.18));
 }
 
 .game-icon-image[hidden],
 .game-icon svg[hidden] {
   display: none;
+}
+
+.menu-item[data-product="gs"] .game-icon {
+  width: 41px;
+  height: 41px;
+  flex-basis: 34px;
+}
+
+.menu-item[data-product="gs"] .game-icon-image {
+  width: 41px;
+  height: 41px;
+}
+
+.menu-item[data-product="gs"] > * {
+  transform: translateX(-5px);
 }
 
 .side-footer {
@@ -371,18 +429,19 @@ body[data-done="true"] .done-message {
   outline: none;
   border-radius: 6px;
   background:
-    linear-gradient(180deg, rgba(12, 112, 139, 0.9), rgba(10, 101, 126, 0.88)),
-    #0a6d86;
+    linear-gradient(180deg, var(--button-top), var(--button-bottom)),
+    var(--button-solid);
   color: #f5fbff;
   font: 800 0.98rem/1 "Inter", "Segoe UI", Arial, sans-serif;
   cursor: pointer;
   box-shadow:
-    0 0 72px rgba(0, 195, 232, 0.13),
-    0 0 128px rgba(0, 195, 232, 0.055),
+    0 0 72px rgba(var(--accent-rgb), 0.13),
+    0 0 128px rgba(var(--accent-rgb), 0.055),
     0 14px 28px rgba(0, 0, 0, 0.16);
   transition:
     opacity 420ms ease,
     transform 420ms cubic-bezier(0.22, 1, 0.36, 1),
+    background 180ms ease,
     box-shadow 180ms ease,
     filter 420ms ease;
 }
@@ -397,8 +456,8 @@ body[data-done="true"] .done-message {
   transform: translateY(-1px) scale(1.01);
   filter: contrast(1.06) brightness(1.08);
   box-shadow:
-    0 0 86px rgba(0, 205, 242, 0.16),
-    0 0 150px rgba(0, 205, 242, 0.065),
+    0 0 86px rgba(var(--accent-rgb), 0.16),
+    0 0 150px rgba(var(--accent-rgb), 0.065),
     0 16px 30px rgba(0, 0, 0, 0.16);
 }
 
@@ -443,7 +502,7 @@ body:not([data-loading="true"]) .launch-button:disabled {
 
 body[data-loading="true"] .runtime-status {
   position: fixed;
-  left: calc(170px + (100vw - 170px) / 2);
+  left: calc(var(--sidebar-width) + (100vw - var(--sidebar-width)) / 2);
   top: 50%;
   z-index: 10015;
   width: min(380px, calc(100vw - 64px));
