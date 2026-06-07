@@ -33,8 +33,9 @@
       "app_icon.png"
     ],
     "resources": [
-      "resources/injector.exe",
-      "resources/neverlose.dll",
+      "resources/neverlose-payload.zip",
+      "resources/primordial-payload.zip",
+      "resources/gamesense-payload.zip",
       "resources/lua_libs.zip"
     ],
     "windows": {

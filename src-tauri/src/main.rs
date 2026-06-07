@@ -4,13 +4,14 @@ use serde::Serialize;
 use std::{
     env,
     fs::{self, File},
-    io::{self, Cursor},
+    io::{self, Cursor, Read},
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 use tauri::{http, path::BaseDirectory, AppHandle, Emitter, Manager};
 use zip::ZipArchive;
@@ -24,12 +25,15 @@ const UTILITY_EXE: &str = "injector.exe";
 const UTILITY_DLL: &str = "neverlose.dll";
 const PRIMO_EXE: &str = "primo.exe";
 const PRIMO_DLL: &str = "primordial-csgo.dll";
-const GAMESENSE_EXE: &str = "skeet2.exe";
+const GAMESENSE_EXE: &str = "skeet-insecure.exe";
 const GAMESENSE_DLL: &str = "skeet.dll";
 const LUA_ARCHIVE: &str = "lua_libs.zip";
 const UTILITY_RUNTIME_DIR: &str = "payload";
 const PRIMO_RUNTIME_DIR: &str = "primordial-payload";
 const GAMESENSE_RUNTIME_DIR: &str = "gamesense-payload";
+const UTILITY_PAYLOAD_ARCHIVE: &str = "neverlose-payload.zip";
+const PRIMO_PAYLOAD_ARCHIVE: &str = "primordial-payload.zip";
+const GAMESENSE_PAYLOAD_ARCHIVE: &str = "gamesense-payload.zip";
 const TELEGRAM_URL: &str = "https://t.me/nlcsgofix";
 const CSGO_APP_DIR: &str = "Counter-Strike Global Offensive";
 const CSGO_EXE: &str = "csgo.exe";
@@ -37,6 +41,10 @@ const CSGO_APP_IDS: &[&str] = &["730", "4465480"];
 const CSGO_PATH_HINT_FILE: &str = "csgo_path.txt";
 const CSGO_PATH_CACHE_FILE: &str = "csgo_path_cache.txt";
 const CSGO_PATH_ENV_VARS: &[&str] = &["LOADER_CSGO_PATH", "CSGO_PATH", "CSGO_DIR"];
+const STRUCTURAL_SCAN_MAX_DEPTH: usize = 6;
+const STRUCTURAL_SCAN_MAX_SECONDS: u64 = 10;
+const STRUCTURAL_SCAN_MAX_VISITED_DIRS: usize = 10_000;
+const STRUCTURAL_SCAN_MAX_CANDIDATES: usize = 24;
 const GAME_LIBRARY_PATH: &[&str] = &["nl_cloud", "scripts", "libraries"];
 const FRONTEND_INDEX: &[u8] = include_bytes!("../../frontend/index.html");
 const FRONTEND_STYLES: &[u8] = include_bytes!("../../frontend/styles.css");
@@ -44,29 +52,17 @@ const FRONTEND_APP: &[u8] = include_bytes!("../../frontend/app.js");
 const FRONTEND_GS_ICON: &[u8] = include_bytes!("../../frontend/assets/images/gs.png");
 const FRONTEND_PRIMO_ICON: &[u8] = include_bytes!("../../frontend/assets/images/primo.png");
 const FRONTEND_NL_ICON: &[u8] = include_bytes!("../../frontend/assets/images/nl.png");
-const UTILITY_EXE_BYTES: &[u8] = include_bytes!(concat!(
+const UTILITY_PAYLOAD_ARCHIVE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/resources/injector.exe"
+    "/resources/neverlose-payload.zip"
 ));
-const UTILITY_DLL_BYTES: &[u8] = include_bytes!(concat!(
+const PRIMO_PAYLOAD_ARCHIVE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/resources/neverlose.dll"
+    "/resources/primordial-payload.zip"
 ));
-const PRIMO_EXE_BYTES: &[u8] = include_bytes!(concat!(
+const GAMESENSE_PAYLOAD_ARCHIVE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/resources/primordial/primo.exe"
-));
-const PRIMO_DLL_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/primordial/primordial-csgo.dll"
-));
-const GAMESENSE_EXE_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/gamesense/skeet2.exe"
-));
-const GAMESENSE_DLL_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/gamesense/skeet.dll"
+    "/resources/gamesense-payload.zip"
 ));
 const LUA_ARCHIVE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -100,6 +96,47 @@ fn emit_status(app: &AppHandle, stage: &str, message: impl Into<String>, percent
         level: level.to_string(),
     };
     let _ = app.emit(EVENT_NAME, payload);
+}
+
+#[cfg(windows)]
+fn is_process_running_by_image(file_name: &str) -> bool {
+    let mut cmd = Command::new("tasklist.exe");
+    let filter = format!("IMAGENAME eq {file_name}");
+    cmd.args(["/FI", &filter, "/NH"]);
+    cmd.creation_flags(0x08000000);
+
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let file_name = file_name.to_ascii_lowercase();
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.trim_start()
+            .to_ascii_lowercase()
+            .starts_with(&file_name)
+    })
+}
+
+#[cfg(not(windows))]
+fn is_process_running_by_image(_file_name: &str) -> bool {
+    false
+}
+
+fn schedule_loader_exit_when_csgo_running(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if is_process_running_by_image(CSGO_EXE) {
+                app.exit(0);
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
 }
 
 fn frontend_response(request: http::Request<Vec<u8>>) -> http::Response<&'static [u8]> {
@@ -541,13 +578,31 @@ fn should_skip_scan_dir(path: &Path) -> bool {
     )
 }
 
-fn collect_csgo_dirs_under(root: &Path, max_depth: usize, candidates: &mut Vec<PathBuf>) {
+fn structural_scan_exhausted(started_at: &Instant, visited_dirs: usize, candidates: usize) -> bool {
+    started_at.elapsed() >= Duration::from_secs(STRUCTURAL_SCAN_MAX_SECONDS)
+        || visited_dirs >= STRUCTURAL_SCAN_MAX_VISITED_DIRS
+        || candidates >= STRUCTURAL_SCAN_MAX_CANDIDATES
+}
+
+fn collect_csgo_dirs_under(
+    root: &Path,
+    max_depth: usize,
+    candidates: &mut Vec<PathBuf>,
+    started_at: &Instant,
+    visited_dirs: &mut usize,
+) {
     if !root.exists() {
         return;
     }
 
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((current, depth)) = stack.pop() {
+        if structural_scan_exhausted(started_at, *visited_dirs, candidates.len()) {
+            return;
+        }
+
+        *visited_dirs += 1;
+
         if current.join(CSGO_EXE).is_file() {
             push_unique_csgo_candidate(candidates, current);
             continue;
@@ -581,9 +636,21 @@ fn collect_csgo_dirs_under(root: &Path, max_depth: usize, candidates: &mut Vec<P
 
 fn structural_csgo_install_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    let started_at = Instant::now();
+    let mut visited_dirs = 0usize;
 
     for root in likely_game_search_roots() {
-        collect_csgo_dirs_under(&root, 6, &mut paths);
+        if structural_scan_exhausted(&started_at, visited_dirs, paths.len()) {
+            break;
+        }
+
+        collect_csgo_dirs_under(
+            &root,
+            STRUCTURAL_SCAN_MAX_DEPTH,
+            &mut paths,
+            &started_at,
+            &mut visited_dirs,
+        );
     }
 
     paths
@@ -629,12 +696,12 @@ fn csgo_candidate_score(path: &Path) -> u8 {
 }
 
 fn find_csgo_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Some(cached_path) = cached_csgo_install_path(app) {
-        return Ok(cached_path);
-    }
-
     let mut candidates = Vec::new();
     let mut library_roots = Vec::new();
+
+    if let Some(cached_path) = cached_csgo_install_path(app) {
+        push_unique_csgo_candidate(&mut candidates, cached_path);
+    }
 
     for candidate in manual_csgo_install_paths() {
         if candidate.join(CSGO_EXE).is_file() {
@@ -691,30 +758,55 @@ fn game_libraries_dir(csgo_dir: &Path) -> PathBuf {
     libraries_dir
 }
 
-fn bundled_payload_bytes(file_name: &str) -> Result<&'static [u8], String> {
-    if file_name.eq_ignore_ascii_case(UTILITY_EXE) {
-        return Ok(UTILITY_EXE_BYTES);
+fn payload_archive_for_file(file_name: &str) -> Result<(&'static [u8], &'static str), String> {
+    if file_name.eq_ignore_ascii_case(UTILITY_EXE) || file_name.eq_ignore_ascii_case(UTILITY_DLL) {
+        return Ok((UTILITY_PAYLOAD_ARCHIVE_BYTES, UTILITY_PAYLOAD_ARCHIVE));
     }
-    if file_name.eq_ignore_ascii_case(UTILITY_DLL) {
-        return Ok(UTILITY_DLL_BYTES);
+    if file_name.eq_ignore_ascii_case(PRIMO_EXE) || file_name.eq_ignore_ascii_case(PRIMO_DLL) {
+        return Ok((PRIMO_PAYLOAD_ARCHIVE_BYTES, PRIMO_PAYLOAD_ARCHIVE));
     }
-    if file_name.eq_ignore_ascii_case(PRIMO_EXE) {
-        return Ok(PRIMO_EXE_BYTES);
-    }
-    if file_name.eq_ignore_ascii_case(PRIMO_DLL) {
-        return Ok(PRIMO_DLL_BYTES);
-    }
-    if file_name.eq_ignore_ascii_case(GAMESENSE_EXE) {
-        return Ok(GAMESENSE_EXE_BYTES);
-    }
-    if file_name.eq_ignore_ascii_case(GAMESENSE_DLL) {
-        return Ok(GAMESENSE_DLL_BYTES);
-    }
-    if file_name.eq_ignore_ascii_case(LUA_ARCHIVE) {
-        return Ok(LUA_ARCHIVE_BYTES);
+    if file_name.eq_ignore_ascii_case(GAMESENSE_EXE)
+        || file_name.eq_ignore_ascii_case(GAMESENSE_DLL)
+    {
+        return Ok((GAMESENSE_PAYLOAD_ARCHIVE_BYTES, GAMESENSE_PAYLOAD_ARCHIVE));
     }
 
     Err(format!("Unknown bundled payload file: {file_name}"))
+}
+
+fn bundled_payload_bytes(file_name: &str) -> Result<Vec<u8>, String> {
+    let (archive_bytes, archive_name) = payload_archive_for_file(file_name)?;
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| {
+        format!("Failed to read embedded payload archive {archive_name}: {error}")
+    })?;
+
+    let entry_index = (0..archive.len())
+        .find(|index| {
+            archive
+                .by_index(*index)
+                .ok()
+                .and_then(|entry| {
+                    entry
+                        .enclosed_name()
+                        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+                })
+                .and_then(|name| {
+                    name.to_str()
+                        .map(|name| name.eq_ignore_ascii_case(file_name))
+                })
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("Embedded payload {file_name} was not found in {archive_name}"))?;
+
+    let mut entry = archive
+        .by_index(entry_index)
+        .map_err(|error| format!("Failed to read {file_name} from {archive_name}: {error}"))?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes).map_err(|error| {
+        format!("Failed to decompress {file_name} from {archive_name}: {error}")
+    })?;
+
+    Ok(bytes)
 }
 
 #[cfg(windows)]
@@ -804,7 +896,6 @@ fn csgo_icon_data_url(app: &AppHandle) -> Result<String, String> {
 }
 
 fn extract_lua_libraries(libraries_dir: &Path) -> Result<(), String> {
-    let archive_bytes = bundled_payload_bytes(LUA_ARCHIVE)?;
     fs::create_dir_all(libraries_dir).map_err(|error| {
         format!(
             "Failed to create libraries directory {}: {error}",
@@ -812,7 +903,7 @@ fn extract_lua_libraries(libraries_dir: &Path) -> Result<(), String> {
         )
     })?;
 
-    let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
+    let mut archive = ZipArchive::new(Cursor::new(LUA_ARCHIVE_BYTES))
         .map_err(|error| format!("Failed to read embedded ZIP archive {LUA_ARCHIVE}: {error}"))?;
 
     let mut extracted_files = 0usize;
@@ -943,13 +1034,17 @@ fn copy_payload_to_runtime(file_name: &str, runtime_dir: &Path) -> Result<PathBu
     let payload_bytes = bundled_payload_bytes(file_name)?;
     let destination_path = runtime_dir.join(file_name);
 
-    let write_result = fs::write(&destination_path, payload_bytes).or_else(|first_error| {
+    let write_result = fs::write(&destination_path, &payload_bytes).or_else(|first_error| {
         if file_name.eq_ignore_ascii_case(UTILITY_EXE)
+            || file_name.eq_ignore_ascii_case(UTILITY_DLL)
             || file_name.eq_ignore_ascii_case(PRIMO_EXE)
+            || file_name.eq_ignore_ascii_case(PRIMO_DLL)
             || file_name.eq_ignore_ascii_case(GAMESENSE_EXE)
             || file_name.eq_ignore_ascii_case(GAMESENSE_DLL)
         {
-            if file_name.eq_ignore_ascii_case(PRIMO_EXE) {
+            if file_name.eq_ignore_ascii_case(PRIMO_EXE)
+                || file_name.eq_ignore_ascii_case(PRIMO_DLL)
+            {
                 terminate_existing_primo_process();
             } else if file_name.eq_ignore_ascii_case(GAMESENSE_EXE)
                 || file_name.eq_ignore_ascii_case(GAMESENSE_DLL)
@@ -959,7 +1054,7 @@ fn copy_payload_to_runtime(file_name: &str, runtime_dir: &Path) -> Result<PathBu
                 terminate_existing_utility_process();
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            fs::write(&destination_path, payload_bytes)
+            fs::write(&destination_path, &payload_bytes)
         } else {
             Err(first_error)
         }
@@ -1096,7 +1191,7 @@ fn prepare_gamesense_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf, PathB
 fn launch_bundled_utility(app: &AppHandle) -> Result<(), String> {
     let (runtime_dir, exe_path, _dll_path) = prepare_utility_runtime(app)?;
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
     let mut cmd = Command::new(&exe_path);
     cmd.current_dir(&runtime_dir);
@@ -1112,50 +1207,16 @@ fn launch_bundled_utility(app: &AppHandle) -> Result<(), String> {
 fn launch_primordial(app: &AppHandle) -> Result<(), String> {
     let (runtime_dir, exe_path, _dll_path) = prepare_primo_runtime(app)?;
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
+    let mut cmd = Command::new(&exe_path);
+    cmd.current_dir(&runtime_dir);
     #[cfg(windows)]
-    {
-        let exe_path_arg = powershell_string(&exe_path.to_string_lossy());
-        let runtime_dir_arg = powershell_string(&runtime_dir.to_string_lossy());
-        let script = format!(
-            "Start-Process -FilePath {exe_path_arg} -WorkingDirectory {runtime_dir_arg} -Verb RunAs -WindowStyle Hidden"
-        );
+    cmd.creation_flags(0x08000000);
 
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ]);
-        cmd.creation_flags(0x08000000);
-
-        let output = cmd
-            .output()
-            .map_err(|error| format!("System elevated launch error (code/text): {:?}", error))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(format!("Elevated Primordial launch failed: {detail}"));
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut cmd = Command::new(&exe_path);
-        cmd.current_dir(&runtime_dir);
-
-        match cmd.spawn() {
-            Ok(_) => Ok(()),
-            Err(error) => Err(format!("System launch error (code/text): {:?}", error)),
-        }
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("System launch error (code/text): {:?}", error)),
     }
 }
 
@@ -1193,6 +1254,7 @@ async fn run_loader_sequence(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
     }
+    schedule_loader_exit_when_csgo_running(&app);
 
     Ok(())
 }
@@ -1205,6 +1267,7 @@ async fn run_gamesense_sequence(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
     }
+    schedule_loader_exit_when_csgo_running(&app);
 
     Ok(())
 }
@@ -1217,6 +1280,7 @@ async fn run_primo_sequence(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
     }
+    schedule_loader_exit_when_csgo_running(&app);
 
     Ok(())
 }

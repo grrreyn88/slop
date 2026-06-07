@@ -11,7 +11,6 @@
   const fillAnimationMs = 900;
   let selectedProduct = "nl";
   let setupStarted = false;
-  let closeTimer = null;
 
   function setLaunchState(text, disabled) {
     if (!launchButton) return;
@@ -102,10 +101,6 @@
 
     if (payload.level === "error") {
       setupStarted = false;
-      if (closeTimer) {
-        window.clearTimeout(closeTimer);
-        closeTimer = null;
-      }
       resetLoaderVisuals();
       if (statusText) statusText.textContent = payload.message || "";
       setLaunchState("Launch", false);
@@ -116,15 +111,6 @@
         document.body.dataset.loading = "false";
         document.body.dataset.done = "true";
         if (statusText) statusText.textContent = "";
-        closeTimer =
-          closeTimer ||
-          window.setTimeout(async () => {
-            if (window.__TAURI__?.core?.invoke) {
-              await window.__TAURI__.core.invoke("close_loader").catch(() => window.close());
-            } else {
-              window.close();
-            }
-          }, 3000);
       }, fillAnimationMs);
     }
   }
@@ -133,10 +119,6 @@
     if (setupStarted || !window.__TAURI__?.core?.invoke) return;
 
     setupStarted = true;
-    if (closeTimer) {
-      window.clearTimeout(closeTimer);
-      closeTimer = null;
-    }
     setProgress(0);
     document.body.dataset.statusLevel = "info";
     document.body.dataset.loading = "true";
