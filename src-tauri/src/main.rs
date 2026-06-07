@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use std::{
+    env,
     fs::{self, File},
     io::{self, Cursor},
     path::{Path, PathBuf},
@@ -32,6 +33,10 @@ const GAMESENSE_RUNTIME_DIR: &str = "gamesense-payload";
 const TELEGRAM_URL: &str = "https://t.me/nlcsgofix";
 const CSGO_APP_DIR: &str = "Counter-Strike Global Offensive";
 const CSGO_EXE: &str = "csgo.exe";
+const CSGO_APP_IDS: &[&str] = &["730", "4465480"];
+const CSGO_PATH_HINT_FILE: &str = "csgo_path.txt";
+const CSGO_PATH_CACHE_FILE: &str = "csgo_path_cache.txt";
+const CSGO_PATH_ENV_VARS: &[&str] = &["LOADER_CSGO_PATH", "CSGO_PATH", "CSGO_DIR"];
 const GAME_LIBRARY_PATH: &[&str] = &["nl_cloud", "scripts", "libraries"];
 const FRONTEND_INDEX: &[u8] = include_bytes!("../../frontend/index.html");
 const FRONTEND_STYLES: &[u8] = include_bytes!("../../frontend/styles.css");
@@ -136,7 +141,29 @@ fn find_steam_path() -> Result<PathBuf, String> {
     Err("Steam registry lookup is only available on Windows.".to_string())
 }
 
-fn parse_vdf_path_value(line: &str) -> Option<PathBuf> {
+fn path_dedupe_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', r"\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: impl Into<PathBuf>) {
+    let path = path.into();
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    let key = path_dedupe_key(&path);
+    if !paths
+        .iter()
+        .any(|existing| path_dedupe_key(existing) == key)
+    {
+        paths.push(path);
+    }
+}
+
+fn parse_vdf_key_value(line: &str) -> Option<(String, String)> {
     let mut quoted_values = line
         .split('"')
         .skip(1)
@@ -144,51 +171,516 @@ fn parse_vdf_path_value(line: &str) -> Option<PathBuf> {
         .map(|value| value.replace(r"\\", r"\"));
 
     match (quoted_values.next(), quoted_values.next()) {
-        (Some(key), Some(value)) if key.eq_ignore_ascii_case("path") => Some(PathBuf::from(value)),
+        (Some(key), Some(value)) => Some((key, value)),
         _ => None,
     }
 }
 
+fn looks_like_filesystem_path(value: &str) -> bool {
+    let value = value.trim();
+    value.contains(r":\")
+        || value.contains(":/")
+        || value.starts_with(r"\\")
+        || value.starts_with('/')
+}
+
+fn parse_vdf_path_value(line: &str) -> Option<PathBuf> {
+    let (key, value) = parse_vdf_key_value(line)?;
+    if key.eq_ignore_ascii_case("path")
+        || (key.parse::<u32>().is_ok() && looks_like_filesystem_path(&value))
+    {
+        Some(PathBuf::from(value))
+    } else {
+        None
+    }
+}
+
+fn parse_app_manifest_install_dir(manifest_path: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(manifest_path).ok()?;
+    for line in contents.lines() {
+        if let Some((key, value)) = parse_vdf_key_value(line.trim()) {
+            if key.eq_ignore_ascii_case("installdir") && !value.trim().is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_csgo_candidate_path(path: impl Into<PathBuf>) -> PathBuf {
+    let path = path.into();
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(CSGO_EXE))
+    {
+        return path.parent().unwrap_or(path.as_path()).to_path_buf();
+    }
+
+    path
+}
+
+fn push_unique_csgo_candidate(paths: &mut Vec<PathBuf>, path: impl Into<PathBuf>) {
+    push_unique_path(paths, normalize_csgo_candidate_path(path));
+}
+
+fn read_csgo_path_hint(path: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(path).ok()?;
+    let value = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+
+    Some(normalize_csgo_candidate_path(value.trim_matches('"')))
+}
+
+fn manual_csgo_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for var_name in CSGO_PATH_ENV_VARS {
+        if let Ok(value) = env::var(var_name) {
+            push_unique_csgo_candidate(&mut paths, value);
+        }
+    }
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            if let Some(path) = read_csgo_path_hint(&exe_dir.join(CSGO_PATH_HINT_FILE)) {
+                push_unique_csgo_candidate(&mut paths, path);
+            }
+        }
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        if let Some(path) = read_csgo_path_hint(&current_dir.join(CSGO_PATH_HINT_FILE)) {
+            push_unique_csgo_candidate(&mut paths, path);
+        }
+    }
+
+    paths
+}
+
+fn cached_csgo_install_path(app: &AppHandle) -> Option<PathBuf> {
+    let cache_path = app
+        .path()
+        .resolve(CSGO_PATH_CACHE_FILE, BaseDirectory::AppLocalData)
+        .ok()?;
+    let cached_path = read_csgo_path_hint(&cache_path)?;
+
+    if cached_path.join(CSGO_EXE).is_file() {
+        Some(cached_path)
+    } else {
+        let _ = fs::remove_file(cache_path);
+        None
+    }
+}
+
+fn remember_csgo_install_path(app: &AppHandle, csgo_dir: &Path) {
+    let Ok(cache_path) = app
+        .path()
+        .resolve(CSGO_PATH_CACHE_FILE, BaseDirectory::AppLocalData)
+    else {
+        return;
+    };
+
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let _ = fs::write(cache_path, csgo_dir.to_string_lossy().as_bytes());
+}
+
 fn steam_library_roots(steam_path: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![steam_path.to_path_buf()];
+    let mut roots = Vec::new();
+    push_unique_path(&mut roots, steam_path);
     let libraryfolders_path = steam_path.join("steamapps").join("libraryfolders.vdf");
 
     if let Ok(contents) = fs::read_to_string(libraryfolders_path) {
         for line in contents.lines() {
             if let Some(path) = parse_vdf_path_value(line.trim()) {
-                roots.push(path);
+                push_unique_path(&mut roots, path);
             }
         }
     }
 
-    let mut unique_roots = Vec::new();
-    for root in roots {
-        let key = root.to_string_lossy().to_lowercase();
-        if !unique_roots
-            .iter()
-            .any(|existing: &PathBuf| existing.to_string_lossy().to_lowercase() == key)
-        {
-            unique_roots.push(root);
+    roots
+}
+
+#[cfg(windows)]
+fn registry_string(
+    root: &windows_registry::Key,
+    key_path: &str,
+    value_name: &str,
+) -> Option<String> {
+    root.open(key_path)
+        .ok()?
+        .get_string(value_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(windows)]
+fn registry_path(
+    root: &windows_registry::Key,
+    key_path: &str,
+    value_name: &str,
+) -> Option<PathBuf> {
+    registry_string(root, key_path, value_name).map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn steam_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(path) = find_steam_path() {
+        push_unique_path(&mut paths, path);
+    }
+
+    for (root, key_path, value_name) in [
+        (
+            &windows_registry::LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Valve\Steam",
+            "InstallPath",
+        ),
+        (
+            &windows_registry::LOCAL_MACHINE,
+            r"SOFTWARE\Valve\Steam",
+            "InstallPath",
+        ),
+        (
+            &windows_registry::CURRENT_USER,
+            r"Software\Valve\Steam",
+            "SteamPath",
+        ),
+    ] {
+        if let Some(path) = registry_path(root, key_path, value_name) {
+            push_unique_path(&mut paths, path);
         }
     }
 
-    unique_roots
+    for var_name in [
+        "STEAM",
+        "STEAM_HOME",
+        "PROGRAMFILES(X86)",
+        "PROGRAMFILES",
+        "PROGRAMW6432",
+    ] {
+        if let Ok(value) = env::var(var_name) {
+            let path = PathBuf::from(value);
+            if var_name.starts_with("PROGRAM") {
+                push_unique_path(&mut paths, path.join("Steam"));
+            } else {
+                push_unique_path(&mut paths, path);
+            }
+        }
+    }
+
+    for path in [
+        PathBuf::from(r"C:\Steam"),
+        PathBuf::from(r"C:\Program Files (x86)\Steam"),
+        PathBuf::from(r"C:\Program Files\Steam"),
+    ] {
+        push_unique_path(&mut paths, path);
+    }
+
+    paths
 }
 
-fn find_csgo_dir() -> Result<PathBuf, String> {
-    let steam_path = find_steam_path()?;
+#[cfg(not(windows))]
+fn steam_install_paths() -> Vec<PathBuf> {
+    find_steam_path().ok().into_iter().collect()
+}
 
-    for library_root in steam_library_roots(&steam_path) {
-        let candidate = library_root
-            .join("steamapps")
-            .join("common")
-            .join(CSGO_APP_DIR);
+#[cfg(windows)]
+fn registry_csgo_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for app_id in CSGO_APP_IDS {
+        for (root, key_path) in [
+            (
+                &windows_registry::LOCAL_MACHINE,
+                format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {app_id}"),
+            ),
+            (
+                &windows_registry::LOCAL_MACHINE,
+                format!(
+                    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {app_id}"
+                ),
+            ),
+            (
+                &windows_registry::CURRENT_USER,
+                format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {app_id}"),
+            ),
+        ] {
+            if let Some(path) = registry_path(root, &key_path, "InstallLocation") {
+                push_unique_path(&mut paths, path);
+            }
+        }
+    }
+
+    paths
+}
+
+#[cfg(not(windows))]
+fn registry_csgo_install_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn likely_steam_library_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for drive in b'C'..=b'Z' {
+        let root = format!("{}:\\", drive as char);
+        if !Path::new(&root).exists() {
+            continue;
+        }
+
+        for relative in [
+            "SteamLibrary",
+            "Steam",
+            r"Games\SteamLibrary",
+            r"Games\Steam",
+            r"Program Files (x86)\Steam",
+            r"Program Files\Steam",
+        ] {
+            push_unique_path(&mut roots, PathBuf::from(&root).join(relative));
+        }
+    }
+
+    roots
+}
+
+#[cfg(not(windows))]
+fn likely_steam_library_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn likely_game_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(current_dir) = env::current_dir() {
+        push_unique_path(&mut roots, current_dir);
+    }
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            push_unique_path(&mut roots, exe_dir);
+        }
+    }
+
+    if let Ok(user_profile) = env::var("USERPROFILE") {
+        let user_profile = PathBuf::from(user_profile);
+        for relative in ["Desktop", "Downloads", "Documents", "Games"] {
+            push_unique_path(&mut roots, user_profile.join(relative));
+        }
+    }
+
+    for var_name in ["PROGRAMFILES(X86)", "PROGRAMFILES", "PROGRAMW6432"] {
+        if let Ok(value) = env::var(var_name) {
+            push_unique_path(&mut roots, PathBuf::from(value));
+        }
+    }
+
+    for drive in b'C'..=b'Z' {
+        let root = format!("{}:\\", drive as char);
+        if !Path::new(&root).exists() {
+            continue;
+        }
+
+        for relative in [
+            "",
+            "Games",
+            "Game",
+            "Downloads",
+            "CSGO",
+            "Counter-Strike",
+            "Counter-Strike Global Offensive",
+            "csgo legacy",
+            "SteamLibrary",
+            "Steam",
+            r"Games\CSGO",
+            r"Games\Counter-Strike Global Offensive",
+            r"Program Files (x86)\Steam\steamapps\common",
+            r"Program Files\Steam\steamapps\common",
+        ] {
+            push_unique_path(&mut roots, PathBuf::from(&root).join(relative));
+        }
+    }
+
+    roots
+}
+
+#[cfg(not(windows))]
+fn likely_game_search_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn should_skip_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "$recycle.bin"
+            | "system volume information"
+            | "windows"
+            | "winnt"
+            | "windows.old"
+            | "programdata"
+            | "appdata"
+            | "node_modules"
+            | "target"
+            | ".git"
+            | ".svn"
+            | ".hg"
+    )
+}
+
+fn collect_csgo_dirs_under(root: &Path, max_depth: usize, candidates: &mut Vec<PathBuf>) {
+    if !root.exists() {
+        return;
+    }
+
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if current.join(CSGO_EXE).is_file() {
+            push_unique_csgo_candidate(candidates, current);
+            continue;
+        }
+
+        if depth >= max_depth {
+            continue;
+        }
+
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            if should_skip_scan_dir(&entry_path) {
+                continue;
+            }
+
+            stack.push((entry_path, depth + 1));
+        }
+    }
+}
+
+fn structural_csgo_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for root in likely_game_search_roots() {
+        collect_csgo_dirs_under(&root, 6, &mut paths);
+    }
+
+    paths
+}
+
+fn candidate_csgo_dirs_from_library_root(library_root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let steamapps_dir = library_root.join("steamapps");
+    let common_dir = steamapps_dir.join("common");
+
+    push_unique_csgo_candidate(&mut candidates, common_dir.join(CSGO_APP_DIR));
+
+    for app_id in ["730", "4465480"] {
+        let manifest_path = steamapps_dir.join(format!("appmanifest_{app_id}.acf"));
+        if let Some(install_dir) = parse_app_manifest_install_dir(&manifest_path) {
+            push_unique_csgo_candidate(&mut candidates, common_dir.join(install_dir));
+        }
+    }
+
+    candidates
+}
+
+fn csgo_candidate_score(path: &Path) -> u8 {
+    let path_text = path_dedupe_key(path);
+    let dir_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    if dir_name.eq_ignore_ascii_case(CSGO_APP_DIR) {
+        return 0;
+    }
+
+    if path_text.contains(r"\counter-strike global offensive") {
+        return 1;
+    }
+
+    if dir_name.eq_ignore_ascii_case("csgo legacy") {
+        return 2;
+    }
+
+    3
+}
+
+fn find_csgo_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(cached_path) = cached_csgo_install_path(app) {
+        return Ok(cached_path);
+    }
+
+    let mut candidates = Vec::new();
+    let mut library_roots = Vec::new();
+
+    for candidate in manual_csgo_install_paths() {
         if candidate.join(CSGO_EXE).is_file() {
+            remember_csgo_install_path(app, &candidate);
+            return Ok(candidate);
+        }
+        push_unique_csgo_candidate(&mut candidates, candidate);
+    }
+
+    for steam_path in steam_install_paths() {
+        for library_root in steam_library_roots(&steam_path) {
+            push_unique_path(&mut library_roots, library_root);
+        }
+    }
+
+    for library_root in likely_steam_library_roots() {
+        push_unique_path(&mut library_roots, library_root);
+    }
+
+    for library_root in library_roots {
+        for candidate in candidate_csgo_dirs_from_library_root(&library_root) {
+            push_unique_path(&mut candidates, candidate);
+        }
+    }
+
+    for path in structural_csgo_install_paths() {
+        push_unique_csgo_candidate(&mut candidates, path);
+    }
+
+    for path in registry_csgo_install_paths() {
+        push_unique_csgo_candidate(&mut candidates, path);
+    }
+
+    candidates.sort_by_key(|path| csgo_candidate_score(path));
+
+    let checked_count = candidates.len();
+    for candidate in candidates {
+        if candidate.join(CSGO_EXE).is_file() {
+            remember_csgo_install_path(app, &candidate);
             return Ok(candidate);
         }
     }
 
-    Err("Could not find Counter-Strike Global Offensive/csgo.exe in Steam libraries.".to_string())
+    Err(format!(
+        "Could not find Counter-Strike Global Offensive/csgo.exe. Checked {checked_count} likely Steam locations."
+    ))
 }
 
 fn game_libraries_dir(csgo_dir: &Path) -> PathBuf {
@@ -294,7 +786,7 @@ fn extract_exe_icon_to_png(_exe_path: &Path, _output_path: &Path) -> Result<(), 
 }
 
 fn csgo_icon_data_url(app: &AppHandle) -> Result<String, String> {
-    let csgo_exe_path = find_csgo_dir()?.join(CSGO_EXE);
+    let csgo_exe_path = find_csgo_dir(app)?.join(CSGO_EXE);
     let icon_path = app
         .path()
         .resolve("csgo-icon.png", BaseDirectory::AppLocalData)
@@ -323,6 +815,7 @@ fn extract_lua_libraries(libraries_dir: &Path) -> Result<(), String> {
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes))
         .map_err(|error| format!("Failed to read embedded ZIP archive {LUA_ARCHIVE}: {error}"))?;
 
+    let mut extracted_files = 0usize;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -356,9 +849,49 @@ fn extract_lua_libraries(libraries_dir: &Path) -> Result<(), String> {
             .map_err(|error| format!("Failed to create {}: {error}", output_path.display()))?;
         io::copy(&mut entry, &mut output_file)
             .map_err(|error| format!("Failed to extract {}: {error}", output_path.display()))?;
+        extracted_files += 1;
+    }
+
+    if extracted_files == 0 {
+        return Err(format!(
+            "Embedded ZIP archive {LUA_ARCHIVE} did not contain any files to extract."
+        ));
+    }
+
+    let installed_files = count_files_recursively(libraries_dir).map_err(|error| {
+        format!(
+            "Failed to verify extracted Lua libraries in {}: {error}",
+            libraries_dir.display()
+        )
+    })?;
+
+    if installed_files == 0 {
+        return Err(format!(
+            "Lua libraries were not installed into {}. Extracted {extracted_files} files from archive, but target directory is empty.",
+            libraries_dir.display()
+        ));
     }
 
     Ok(())
+}
+
+fn count_files_recursively(path: &Path) -> io::Result<usize> {
+    let mut count = 0usize;
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                count += 1;
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 fn clean_windows_path(path: &Path) -> PathBuf {
@@ -647,7 +1180,7 @@ fn launch_gamesense(app: &AppHandle) -> Result<(), String> {
 
 async fn run_loader_sequence(app: AppHandle) -> Result<(), String> {
     emit_status(&app, "steam", "Finding CS:GO installation...", 25, "info");
-    let csgo_dir = find_csgo_dir()?;
+    let csgo_dir = find_csgo_dir(&app)?;
     let libraries_dir = game_libraries_dir(&csgo_dir);
 
     emit_status(&app, "archive", "Installing Lua libraries...", 50, "info");
