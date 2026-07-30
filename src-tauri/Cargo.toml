@@ -1,20 +1,27 @@
 [package]
-name = "loader"
+name = "envy-loader"
 version = "0.1.0"
-description = "loader"
+description = "envy loader"
 authors = ["you"]
 edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-embed-resource = "2"
 
 [dependencies]
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tauri = { version = "2.0", features = [] }
-tokio = { version = "1.0", features = ["time", "macros", "rt-multi-thread"] }
+tauri-plugin-opener = "2"
+tokio = { version = "1.0", features = ["time"] }
 zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Loader</title>
+    <title>envy</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -11,7 +11,7 @@
       <section class="window-frame">
         <div class="drag-strip"></div>
         <div id="loaderFill" class="loader-fill" aria-hidden="true"></div>
-        <div id="doneMessage" class="done-message" aria-live="polite">Done. Open csgo</div>
+        <div class="done-message" aria-live="polite">Done. Open csgo</div>
 
         <div class="window-controls">
           <button id="minimizeButton" class="control-btn" aria-label="Minimize">
@@ -27,7 +27,21 @@
         </div>
 
         <aside class="sidebar">
-          <div class="brand-mark">:P</div>
+          <div class="brand-block">
+            <div class="brand-mark">envy</div>
+            <div class="brand-social-links" aria-label="Community links">
+              <a class="brand-social-link telegram" href="https://t.me/nlcsgofix" aria-label="Telegram" title="Telegram">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20.8 4.7 17.9 19c-.2 1-.8 1.2-1.6.8l-4.4-3.2-2.1 2c-.2.2-.4.4-.9.4l.3-4.5 8.2-7.4c.4-.3-.1-.5-.5-.2L6.8 13.3 2.4 12c-1-.3-1-1 .2-1.4L19.7 4c.8-.3 1.5.2 1.1.7Z" />
+                </svg>
+              </a>
+              <a class="brand-social-link discord" href="https://discord.gg/5URKaMyZrD" aria-label="Discord" title="Discord">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M19.5 5.3A16 16 0 0 0 15.4 4l-.5 1a15 15 0 0 0-5.8 0l-.5-1a16 16 0 0 0-4.1 1.3C1.9 9.2 1.2 13 1.5 16.8A16.7 16.7 0 0 0 6.6 19l1.2-1.7a10.5 10.5 0 0 1-1.9-.9l.5-.4a11.5 11.5 0 0 0 11.2 0l.5.4a10.5 10.5 0 0 1-1.9.9l1.2 1.7a16.7 16.7 0 0 0 5.1-2.2c.4-4.4-.7-8.1-3-11.5ZM8.8 14.5c-1 0-1.8-.9-1.8-2s.8-2 1.8-2 1.8.9 1.8 2-.8 2-1.8 2Zm6.4 0c-1 0-1.8-.9-1.8-2s.8-2 1.8-2 1.8.9 1.8 2-.8 2-1.8 2Z" />
+                </svg>
+              </a>
+            </div>
+          </div>
 
           <nav class="menu-list" aria-label="products">
             <button class="menu-item menu-item-with-icon" type="button" data-product="gs">
@@ -51,16 +65,21 @@
           </nav>
 
           <div class="side-footer">
-            <span class="telegram-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24">
-                <path d="M20.8 4.7 17.9 19c-.2 1-.8 1.2-1.6.8l-4.4-3.2-2.1 2c-.2.2-.4.4-.9.4l.3-4.5 8.2-7.4c.4-.3-.1-.5-.5-.2L6.8 13.3 2.4 12c-1-.3-1-1  .2-1.4L19.7 4c.8-.3 1.5.2 1.1.7Z" />
-              </svg>
-            </span>
-            <div class="profile-text">
-              <a id="telegramLink" class="profile-name" href="https://t.me/nlcsgofix" target="_blank" rel="noreferrer">
-                t.me/nlcsgofix
-              </a>
-              <p class="profile-status">Lifetime</p>
+            <div class="profile-row">
+              <button id="profileAvatarButton" class="profile-avatar-button" type="button" title="Change avatar" disabled>
+                <img id="profileAvatar" class="profile-avatar" alt="" />
+              </button>
+              <input id="avatarFileInput" class="avatar-file-input" type="file" accept="image/*" />
+              <div class="profile-text">
+                <input id="profileUsername" class="profile-field profile-name-input" type="text" maxlength="13" aria-label="Username" disabled />
+                <button id="profileExpirationButton" class="profile-expiration-button" type="button" title="Change expiration date" disabled>
+                  <span id="profileExpirationText">Loading...</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M7 3v3M17 3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v14H4V6a1 1 0 0 1 1-1Z" />
+                  </svg>
+                </button>
+                <input id="profileExpiration" class="profile-expiration-input" type="datetime-local" aria-label="Expiration date" disabled />
+              </div>
             </div>
           </div>
         </aside>
